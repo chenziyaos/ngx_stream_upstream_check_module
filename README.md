@@ -1,8 +1,9 @@
 # ngx_stream_upstream_check_module  
-该模块可以为Nginx提供主动式后端服务器健康检查的功能（检查类型支持 tcp/udp/http/mysql）。
-
+该模块可以为Nginx提供主动式后端服务器健康检查的功能（检查类型支持 tcp/udp/http）。
+1. 整合tcp和http
+2. 增加发送字符串检查服务状态
 ## apply patch
-`cd nginx-src ; git git apply patch_path`
+`cd src ; git git apply patch_path`
 
 ## build and install
 
