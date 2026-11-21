@@ -17,10 +17,11 @@ nginx 开源版的 stream upstream 只有被动检查（`max_fails` / `fail_time
 | nginx 版本 | 核心补丁 | 说明 |
 |---|---|---|
 | 1.31.x（mainline） | `patch/nginx-1.31.patch` | 覆盖 round robin、hash、least_conn、random、least_time |
-| 1.24 – 1.30（stable 1.30.x） | `patch/nginx-1.24-1.30.patch` | 覆盖 round robin、hash、least_conn、random |
+| 1.28 – 1.30（stable 1.30.x） | `patch/nginx-1.28-1.30.patch` | 覆盖 round robin、hash、least_conn、random |
+| 1.24 – 1.26 | `patch/nginx-1.24-1.26.patch` | 同上。1.27.x 没有对应补丁 |
 | 1.12 – 1.22 | `patch/legacy/nginx-1.12-1.22.patch` | 2017 年的原始补丁，不覆盖 random：用 `random` 时流量仍会打到 down 的节点 |
 
-CI 在 Ubuntu 24.04 上对 1.22.1、1.24.0、1.26.3、1.28.3、1.30.7、1.31.9 逐个编译并跑集成测试。没有列出的版本没有验证过；补丁打不上时 `patch` 会报错退出，不会静默生成有问题的二进制。
+CI 在 Ubuntu 24.04 上对 1.22.1、1.24.0、1.26.3、1.28.3、1.30.7、1.31.9 逐个编译并跑集成测试。没有列出的版本没有验证过。补丁要按上表的版本选：GNU patch 对不上时会报错，但 macOS 自带的 patch 和 `git apply` 可能把补丁打到别的位置而不报错（1.30 的补丁打到 1.24 上就是这样）。
 
 ## 编译
 
@@ -38,7 +39,7 @@ CI 在 Ubuntu 24.04 上对 1.22.1、1.24.0、1.26.3、1.28.3、1.30.7、1.31.9 �
 
 ```bash
 cd nginx-1.30.7
-patch -p1 < /path/to/ngx_stream_upstream_check_module/patch/nginx-1.24-1.30.patch
+patch -p1 < /path/to/ngx_stream_upstream_check_module/patch/nginx-1.28-1.30.patch
 ./configure --with-stream --add-module=/path/to/ngx_stream_upstream_check_module
 make && make install
 ```

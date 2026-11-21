@@ -9,7 +9,8 @@ shift
 
 case $ver in
     1.31.*)                 patch=nginx-1.31.patch ;;
-    1.2[4-9].*|1.30.*)      patch=nginx-1.24-1.30.patch ;;
+    1.2[89].*|1.30.*)       patch=nginx-1.28-1.30.patch ;;
+    1.2[4-6].*)             patch=nginx-1.24-1.26.patch ;;
     1.1[2-9].*|1.2[0-3].*)  patch=legacy/nginx-1.12-1.22.patch ;;
     *) echo "no core patch for nginx $ver" >&2; exit 1 ;;
 esac
