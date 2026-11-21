@@ -1,5 +1,12 @@
 /*
- *  2017-12-11 chenziyao(chenziyaos@163.com)
+ * Copyright (C) 2014 Weibin Yao (yaoweibin@gmail.com)
+ * Copyright (C) 2010-2014 Alibaba Group Holding Limited
+ * Copyright (C) 2017 Changxun Zhou (zhoucx@dtdream.com)
+ * Copyright (C) 2017-2026 Ziyao Chen
+ *
+ * Stream (TCP/UDP) port of nginx_upstream_check_module by Weibin Yao,
+ * by Changxun Zhou; send/expect checks and nginx 1.30+ support by Ziyao Chen.
+ * BSD 2-Clause License, see LICENSE.
  */
 
 
@@ -12,22 +19,6 @@
 typedef struct ngx_stream_upstream_check_peer_s ngx_stream_upstream_check_peer_t;
 typedef struct ngx_stream_upstream_check_srv_conf_s
         ngx_stream_upstream_check_srv_conf_t;
-
-#pragma pack(push, 1)
-
-typedef struct {
-    u_char                                   packet_length[3];
-    u_char                                   packet_number;
-    u_char                                   protocol_version;
-    u_char                                   others[0];
-} ngx_mysql_handshake_init_t;
-
-
-typedef struct {
-    uint16_t                                 preamble;
-    uint16_t                                 length;
-    u_char                                   type;
-} ngx_ajp_raw_packet_t;
 
 typedef struct {
     ngx_buf_t                                send;
@@ -129,7 +120,6 @@ typedef struct {
 #define NGX_STREAM_CHECK_TCP                   0x0001
 #define NGX_STREAM_CHECK_HTTP                  0x0002
 #define NGX_STREAM_CHECK_UDP                   0x0004
-#define NGX_STREAM_CHECK_MYSQL                 0x0008
 
 
 #define NGX_CHECK_HTTP_2XX                   0x0002
@@ -248,8 +238,6 @@ static ngx_int_t ngx_stream_upstream_check_parse_status_line(
 static void ngx_stream_upstream_check_backend_reinit(
         ngx_stream_upstream_check_peer_t *peer);
 static ngx_int_t ngx_stream_upstream_check_expect_parse(ngx_stream_upstream_check_peer_t *peer);
-static ngx_int_t ngx_stream_upstream_check_parse_match(ngx_stream_upstream_check_ctx_t *ctx, ngx_buf_t *b,
-const ngx_str_t *expect);
 static void ngx_stream_upstream_check_status_update(
         ngx_stream_upstream_check_peer_t *peer,
         ngx_int_t result);
@@ -374,15 +362,21 @@ static ngx_command_t  ngx_stream_upstream_check_commands[] = {
           0,
           NULL },
 
-        {
-          ngx_string("check_send"),
+        { ngx_string("check_http_send"),
           NGX_STREAM_UPS_CONF|NGX_CONF_TAKE1,
           ngx_stream_upstream_check_backend_send,
           0,
           0,
           NULL },
-        {
-          ngx_string("check_backend_expect_alive"),
+
+        { ngx_string("check_send"),
+          NGX_STREAM_UPS_CONF|NGX_CONF_TAKE1,
+          ngx_stream_upstream_check_backend_send,
+          0,
+          0,
+          NULL },
+
+        { ngx_string("check_backend_expect_alive"),
           NGX_STREAM_UPS_CONF|NGX_CONF_TAKE1,
           ngx_stream_upstream_check_backend_expect,
           0,
@@ -446,11 +440,11 @@ static ngx_check_conf_t  ngx_check_types[] = {
                 ngx_string("tcp"),
                 ngx_null_string,
                 0,
-                ngx_stream_upstream_check_peer_handler,
                 ngx_stream_upstream_check_peek_handler,
-                ngx_stream_upstream_check_backend_init,
-                ngx_stream_upstream_check_expect_parse,
-                ngx_stream_upstream_check_backend_reinit,
+                ngx_stream_upstream_check_peek_handler,
+                NULL,
+                NULL,
+                NULL,
                 0,
                 0 },
         { NGX_STREAM_CHECK_UDP,
@@ -461,7 +455,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
                 ngx_stream_upstream_check_send_handler,
                 ngx_stream_upstream_check_peek_handler,
                 ngx_stream_upstream_check_backend_init,
-                ngx_stream_upstream_check_expect_parse,
+                NULL,
                 ngx_stream_upstream_check_backend_reinit,
                 1,
                 0 },
@@ -490,6 +484,37 @@ static ngx_check_conf_t  ngx_check_types[] = {
                 0 }
 };
 
+
+/*
+ * "check_backend_expect_alive" turns tcp and udp checks into
+ * send (check_send, may be empty) + receive + substring match.
+ */
+static ngx_check_conf_t  ngx_check_tcp_expect = {
+        NGX_STREAM_CHECK_TCP,
+        ngx_string("tcp"),
+        ngx_null_string,
+        0,
+        ngx_stream_upstream_check_send_handler,
+        ngx_stream_upstream_check_recv_handler,
+        ngx_stream_upstream_check_backend_init,
+        ngx_stream_upstream_check_expect_parse,
+        ngx_stream_upstream_check_backend_reinit,
+        1,
+        0 };
+
+static ngx_check_conf_t  ngx_check_udp_expect = {
+        NGX_STREAM_CHECK_UDP,
+        ngx_string("udp"),
+        ngx_string("X"),
+        0,
+        ngx_stream_upstream_check_send_handler,
+        ngx_stream_upstream_check_recv_handler,
+        ngx_stream_upstream_check_backend_init,
+        ngx_stream_upstream_check_expect_parse,
+        ngx_stream_upstream_check_backend_reinit,
+        1,
+        0 };
+
 static ngx_uint_t ngx_stream_upstream_check_shm_generation = 0;
 static ngx_stream_upstream_check_peers_t *check_peers_ctx = NULL;
 
@@ -503,19 +528,18 @@ ngx_stream_upstream_check_add_peer(ngx_conf_t *cf,
     ngx_stream_upstream_check_srv_conf_t   *ucscf;
     ngx_stream_upstream_check_main_conf_t  *ucmcf;
 
-    ngx_log_error(NGX_LOG_INFO, cf->log, 0,
-                      "add a peer:( %V ) to stream health check list.",
-                      &peer_addr->name);
-
     if (us->srv_conf == NULL) {
-        return NGX_ERROR;
+        return 0;
     }
 
     ucscf = ngx_stream_conf_upstream_srv_conf(us, ngx_stream_upstream_check_module);
 
-    if(ucscf->check_interval == 0) {
-        return NGX_ERROR;
+    if (ucscf->check_interval == 0) {
+        return 0;
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_STREAM, cf->log, 0,
+                   "stream upstream check: add peer %V", &peer_addr->name);
 
     ucmcf = ngx_stream_conf_get_module_main_conf(cf,
                                                ngx_stream_upstream_check_module);
@@ -523,7 +547,7 @@ ngx_stream_upstream_check_add_peer(ngx_conf_t *cf,
 
     peer = ngx_array_push(&peers->peers);
     if (peer == NULL) {
-        return NGX_ERROR;
+        return (ngx_uint_t) NGX_ERROR;
     }
 
     ngx_memzero(peer, sizeof(ngx_stream_upstream_check_peer_t));
@@ -537,14 +561,14 @@ ngx_stream_upstream_check_add_peer(ngx_conf_t *cf,
     if (ucscf->port) {
         peer->check_peer_addr = ngx_pcalloc(cf->pool, sizeof(ngx_addr_t));
         if (peer->check_peer_addr == NULL) {
-            return NGX_ERROR;
+            return (ngx_uint_t) NGX_ERROR;
         }
 
         if (ngx_stream_upstream_check_addr_change_port(cf->pool,
                                                        peer->check_peer_addr, peer_addr, ucscf->port)
             != NGX_OK) {
 
-            return NGX_ERROR;
+            return (ngx_uint_t) NGX_ERROR;
         }
 
     } else {
@@ -554,7 +578,8 @@ ngx_stream_upstream_check_add_peer(ngx_conf_t *cf,
     peers->checksum +=
             ngx_murmur_hash2(peer_addr->name.data, peer_addr->name.len);
 
-    return peer->index;
+    /* 0 means "not checked", so slot n is handed out as n + 1 */
+    return peer->index + 1;
 }
 
 
@@ -620,14 +645,16 @@ ngx_stream_upstream_check_addr_change_port(ngx_pool_t *pool, ngx_addr_t *dst,
 
 
 ngx_uint_t
-ngx_stream_upstream_check_peer_down(ngx_uint_t index)
+ngx_stream_upstream_check_peer_down(ngx_uint_t id)
 {
     ngx_stream_upstream_check_peer_t  *peer;
+    ngx_uint_t                         index;
 
-    if (check_peers_ctx == NULL || index >= check_peers_ctx->peers.nelts) {
+    if (check_peers_ctx == NULL || id == 0 || id > check_peers_ctx->peers.nelts) {
         return 0;
     }
 
+    index = id - 1;
     peer = check_peers_ctx->peers.elts;
 
     return (peer[index].shm->down);
@@ -636,14 +663,16 @@ ngx_stream_upstream_check_peer_down(ngx_uint_t index)
 
 /* TODO: this interface can count each peer's busyness */
 void
-ngx_stream_upstream_check_get_peer(ngx_uint_t index)
+ngx_stream_upstream_check_get_peer(ngx_uint_t id)
 {
     ngx_stream_upstream_check_peer_t  *peer;
+    ngx_uint_t                         index;
 
-    if (check_peers_ctx == NULL || index >= check_peers_ctx->peers.nelts) {
+    if (check_peers_ctx == NULL || id == 0 || id > check_peers_ctx->peers.nelts) {
         return;
     }
 
+    index = id - 1;
     peer = check_peers_ctx->peers.elts;
 
     ngx_shmtx_lock(&peer[index].shm->mutex);
@@ -656,14 +685,16 @@ ngx_stream_upstream_check_get_peer(ngx_uint_t index)
 
 
 void
-ngx_stream_upstream_check_free_peer(ngx_uint_t index)
+ngx_stream_upstream_check_free_peer(ngx_uint_t id)
 {
     ngx_stream_upstream_check_peer_t  *peer;
+    ngx_uint_t                         index;
 
-    if (check_peers_ctx == NULL || index >= check_peers_ctx->peers.nelts) {
+    if (check_peers_ctx == NULL || id == 0 || id > check_peers_ctx->peers.nelts) {
         return;
     }
 
+    index = id - 1;
     peer = check_peers_ctx->peers.elts;
 
     ngx_shmtx_lock(&peer[index].shm->mutex);
@@ -889,13 +920,18 @@ ngx_stream_upstream_check_connect_handler(ngx_event_t *event)
     c->pool = peer->pool;
 
 
-	//set sock opt "IP_RECVERR" in order to recv icmp error like host unreachable.
-    int val = 1;
-    if( setsockopt( c->fd, SOL_IP, IP_RECVERR, &val, sizeof(val) ) == -1 ){
-        ngx_log_error(NGX_LOG_ERR, event->log, 0,
-              "setsockopt(IP_RECVERR) failed with peer: %V ",
-              &peer->check_peer_addr->name);
+#if (NGX_LINUX) && defined(IP_RECVERR)
+    {
+    int  val = 1;
+
+    /* report ICMP errors such as "host unreachable" on the socket */
+    if (setsockopt(c->fd, SOL_IP, IP_RECVERR, &val, sizeof(val)) == -1) {
+        ngx_log_error(NGX_LOG_ERR, event->log, ngx_socket_errno,
+                      "setsockopt(IP_RECVERR) failed with peer: %V ",
+                      &peer->check_peer_addr->name);
     }
+    }
+#endif
 
     upstream_check_connect_done:
     peer->state = NGX_STREAM_CHECK_CONNECT_DONE;
@@ -1103,6 +1139,10 @@ ngx_stream_upstream_check_send_handler(ngx_event_t *event)
         ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0, "stream check send done.");
         peer->state = NGX_STREAM_CHECK_SEND_DONE;
         c->requests++;
+
+        if (c->read->ready) {
+            c->read->handler(c->read);
+        }
     }
 
     return;
@@ -1323,55 +1363,41 @@ ngx_stream_upstream_check_http_parse(ngx_stream_upstream_check_peer_t *peer)
     return NGX_OK;
 }
 
+#define NGX_STREAM_CHECK_EXPECT_MAX         16384
+
+
 static ngx_int_t
 ngx_stream_upstream_check_expect_parse(ngx_stream_upstream_check_peer_t *peer)
 {
-    ngx_int_t                            rc;
+    size_t                                 len;
     ngx_stream_upstream_check_ctx_t       *ctx;
     ngx_stream_upstream_check_srv_conf_t  *ucscf;
 
     ucscf = peer->conf;
     ctx = peer->check_data;
+    len = ctx->recv.last - ctx->recv.pos;
 
-    if ((ctx->recv.last - ctx->recv.pos) > 0) {
-
-        rc = ngx_stream_upstream_check_parse_match(ctx,
-                                                         &ctx->recv,
-                                                         &ucscf->expect);
-        if (rc == NGX_AGAIN) {
-            return rc;
-        }
-
-        if (rc == NGX_ERROR) {
-            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                          "http parse status line error with peer: %V ",
-                          &peer->check_peer_addr->name);
-            return rc;
-        }
+    if (len >= ucscf->expect.len
+        && ngx_strlcasestrn(ctx->recv.pos, ctx->recv.last, ucscf->expect.data,
+                            ucscf->expect.len - 1)
+           != NULL)
+    {
+        return NGX_OK;
     }
 
-    return NGX_OK;
-}
-
-static ngx_int_t ngx_stream_upstream_check_parse_match(ngx_stream_upstream_check_ctx_t *ctx, ngx_buf_t *b,
-const ngx_str_t *expect){
-    u_char ch, *p , first = expect->data[0];
-    ngx_int_t rc;
-    for (p = b->pos; p < b->last; p++) {
-        ch = *p;
-        if(ch != first){
-          continue;
-        }
-        if( (rc = ngx_strncasecmp(p, expect->data, expect->len))==0){
-            return NGX_OK;
-        }
-    }
-    if( p == b->last){
+    /* a datagram is the whole reply */
+    if (peer->pc.type == SOCK_DGRAM || len >= NGX_STREAM_CHECK_EXPECT_MAX) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "check expect \"%V\" not found in first %uz bytes "
+                      "from peer: %V", &ucscf->expect, len,
+                      &peer->check_peer_addr->name);
         return NGX_ERROR;
     }
-    return NGX_OK;
 
+    /* not yet: keep reading until match, close or check timeout */
+    return NGX_AGAIN;
 }
+
 
 static ngx_int_t
 ngx_stream_upstream_check_parse_status_line(ngx_stream_upstream_check_ctx_t *ctx,
@@ -1676,6 +1702,14 @@ ngx_stream_upstream_check_timeout_handler(ngx_event_t *event)
                   &peer->check_peer_addr->name);
 
         ngx_stream_upstream_check_status_update(peer, 0);
+	}else if(peer->pc.type == SOCK_DGRAM && peer->conf->expect.len){
+	    peer->pc.connection->error = 1;
+
+	    ngx_log_error(NGX_LOG_ERR, event->log, 0,
+                  "udp check got no expected reply from peer: %V, set it down.",
+                  &peer->check_peer_addr->name);
+
+        ngx_stream_upstream_check_status_update(peer, 0);
 	}else if(peer->pc.type == SOCK_DGRAM){
 	    peer->pc.connection->error = 0;
 
@@ -1972,6 +2006,18 @@ ngx_stream_upstream_check_backend_expect(ngx_conf_t *cf, ngx_command_t *cmd,
 {
     ngx_str_t                           *value;
     ngx_stream_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    if (value[1].len == 0) {
+        return "requires a non-empty string";
+    }
+
+    ucscf = ngx_stream_conf_get_module_srv_conf(cf,
+                                              ngx_stream_upstream_check_module);
+
+    ucscf->expect = value[1];
+
     return NGX_CONF_OK;
 }
 
@@ -2166,11 +2212,33 @@ ngx_stream_upstream_check_init_srv_conf(ngx_conf_t *cf, void *conf)
     }
 
     check = ucscf->check_type_conf;
-    // check_type
+
+    if (check && ucscf->expect.len) {
+        if (check->type == NGX_STREAM_CHECK_TCP) {
+            check = ucscf->check_type_conf = &ngx_check_tcp_expect;
+
+        } else if (check->type == NGX_STREAM_CHECK_UDP) {
+            check = ucscf->check_type_conf = &ngx_check_udp_expect;
+
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"check_backend_expect_alive\" is only "
+                               "supported for type=tcp and type=udp, "
+                               "use \"check_http_expect_alive\" for http");
+            return NGX_CONF_ERROR;
+        }
+
+    } else if (check && check->type == NGX_STREAM_CHECK_TCP && ucscf->send.len) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"check_send\" with type=tcp needs "
+                           "\"check_backend_expect_alive\"");
+        return NGX_CONF_ERROR;
+    }
+
     if (check) {
-        if (ucscf->send.len == 0){
-          ucscf->send.data = check->default_send.data;
-          ucscf->send.len = check->default_send.len;
+        if (ucscf->send.len == 0 && check->type != NGX_STREAM_CHECK_TCP) {
+            ucscf->send.data = check->default_send.data;
+            ucscf->send.len = check->default_send.len;
         }
         //for http
         if (ucscf->code.status_alive == 0) {
@@ -2963,7 +3031,7 @@ static void
 ngx_stream_upstream_check_status_json_format(ngx_buf_t *b,
     ngx_stream_upstream_check_peers_t *peers, ngx_uint_t flag)
 {
-    ngx_uint_t                       count, i, last;
+    ngx_uint_t                       count, i, n;
     ngx_stream_upstream_check_peer_t  *peer;
 
     peer = peers->peers.elts;
@@ -2996,7 +3064,7 @@ ngx_stream_upstream_check_status_json_format(ngx_buf_t *b,
             count,
             ngx_stream_upstream_check_shm_generation);
 
-    last = peers->peers.nelts - 1;
+    n = 0;
     for (i = 0; i < peers->peers.nelts; i++) {
 
         if (flag & NGX_CHECK_STATUS_DOWN) {
@@ -3013,15 +3081,15 @@ ngx_stream_upstream_check_status_json_format(ngx_buf_t *b,
         }
 
         b->last = ngx_snprintf(b->last, b->end - b->last,
-                "    {\"index\": %ui, "
+                "%s    {\"index\": %ui, "
                 "\"upstream\": \"%V\", "
                 "\"name\": \"%V\", "
                 "\"status\": \"%s\", "
                 "\"rise\": %ui, "
                 "\"fall\": %ui, "
                 "\"type\": \"%V\", "
-                "\"port\": %ui}"
-                "%s\n",
+                "\"port\": %ui}",
+                n++ ? ",\n" : "",
                 i,
                 peer[i].upstream_name,
                 &peer[i].peer_addr->name,
@@ -3029,12 +3097,11 @@ ngx_stream_upstream_check_status_json_format(ngx_buf_t *b,
                 peer[i].shm->rise_count,
                 peer[i].shm->fall_count,
                 &peer[i].conf->check_type_conf->name,
-                peer[i].conf->port,
-                (i == last) ? "" : ",");
+                peer[i].conf->port);
     }
 
     b->last = ngx_snprintf(b->last, b->end - b->last,
-            "  ]\n");
+            "%s  ]\n", n ? "\n" : "");
 
     b->last = ngx_snprintf(b->last, b->end - b->last,
             "}}\n");
